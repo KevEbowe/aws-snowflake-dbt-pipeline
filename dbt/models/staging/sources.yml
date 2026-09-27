@@ -1,0 +1,23 @@
+version: 2
+sources:
+  - name: raw
+    database: CYBER_INSURANCE
+    schema: RAW
+    tables:
+      - name: security_events
+      - name: customers
+models:
+  - name: stg_security_events
+    columns:
+      - name: event_id
+        tests: [not_null]
+      - name: customer_id
+        tests: [not_null]
+      - name: severity
+        tests:
+          - accepted_values:
+              values: ['low', 'medium', 'high', 'critical']
+  - name: stg_customers
+    columns:
+      - name: customer_id
+        tests: [not_null]

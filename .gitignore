@@ -1,0 +1,37 @@
+# Environment variables / secrets
+.env
+.env.*
+!.env.example
+
+# AWS credentials
+.aws/
+credentials
+
+# Airflow
+airflow/metadata/
+airflow.db
+logs/
+*.log
+
+# dbt generated files
+dbt/target/
+dbt/logs/
+dbt_packages/
+dbt/.user.yml
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Misc
+*.tmp
+*.swp

@@ -1,0 +1,17 @@
+name: cyber_insurance
+version: '1.0.0'
+config-version: 2
+profile: cyber_insurance
+model-paths: ["models"]
+snapshot-paths: ["snapshots"]
+models:
+  cyber_insurance:
+    staging:
+      +materialized: view
+      +schema: STAGING
+    intermediate:
+      +materialized: view
+      +schema: INTERMEDIATE
+    marts:
+      +materialized: table
+      +schema: ANALYTICS

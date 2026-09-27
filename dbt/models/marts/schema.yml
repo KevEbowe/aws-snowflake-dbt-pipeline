@@ -1,0 +1,12 @@
+version: 2
+models:
+  - name: fct_security_events
+    columns:
+      - name: event_id
+        tests: [unique, not_null]
+      - name: customer_id
+        tests: [not_null]
+  - name: dim_customers
+    columns:
+      - name: customer_id
+        tests: [unique, not_null]

@@ -1,0 +1,32 @@
+services:
+  mock-api:
+    build: ./producer
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+  airflow:
+    build: .
+    depends_on:
+      - mock-api
+    ports:
+      - "8080:8080"
+    env_file: .env
+    environment:
+      AIRFLOW_HOME: /opt/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW_CONN_AWS_DEFAULT: 'aws://'
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/metadata/airflow.db
+      AIRFLOW__CORE__PARALLELISM: "4"
+      AWS_PROFILE: airflow-s3
+      # SnowflakeHook obtains credentials via this Airflow connection URI.
+      AIRFLOW_CONN_SNOWFLAKE_DEFAULT: 'snowflake://${SNOWFLAKE_USER}:${SNOWFLAKE_PASSWORD}@/${SNOWFLAKE_DATABASE}?account=${SNOWFLAKE_ACCOUNT}&warehouse=${SNOWFLAKE_WAREHOUSE}&role=${SNOWFLAKE_ROLE}'
+      API_URL: http://mock-api:8000
+      PYTHONPATH: /opt/airflow
+    volumes:
+      - ./airflow/dags:/opt/airflow/dags
+      - ./snowflake:/opt/airflow/snowflake:ro
+      - ./dbt:/opt/airflow/dbt
+      - ./logs:/opt/airflow/logs
+      - ./airflow/metadata:/opt/airflow/metadata
+      - ~/.aws:/home/airflow/.aws:ro
+    command: standalone
