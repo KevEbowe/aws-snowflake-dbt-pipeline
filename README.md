@@ -1,44 +1,10 @@
-# Cyber Insurance Data Pipeline
+# Cyber Insurance Data Engineering Pipeline
 
-I built this project to practice building an end-to-end data engineering pipeline using tools that are commonly used together in production: **Airflow, AWS S3, Snowflake, dbt, Docker, and Python**.
+An end-to-end batch data pipeline for ingesting, processing, and transforming cybersecurity event and customer data using **Apache Airflow, AWS S3, Snowflake, dbt, Docker, and Python**.
 
-The pipeline pulls cybersecurity event and customer data from a mock API, lands the raw data in S3, loads it into Snowflake, and uses dbt to clean, deduplicate, track customer history, and build analytics-ready tables.
+The pipeline ingests data from an API, lands immutable raw files in S3, loads them into Snowflake, and uses dbt to build staging, intermediate, historical, and analytics-ready models.
 
-I also added a few problems that data pipelines commonly have to deal with, including duplicate records, late-arriving data, source updates, incremental loads, and changing customer attributes.
-
-## Architecture
-
-```text
-FastAPI Mock API
-        |
-        v
-     Airflow
-        |
-        v
-     AWS S3
-   (Raw NDJSON)
-        |
-        v
- Snowflake RAW
-        |
-        v
-   dbt Staging
-        |
-        v
- dbt Intermediate
-   |          |
-   |          +--> Deduplication
-   |          +--> Latest records
-   |
-   v
-dbt Snapshot (SCD2)
-        |
-        v
-  Analytics Marts
-   |      |      |
-   v      v      v
-  DIM    FACT   Daily Summary
-```
+The implementation also handles several common data engineering concerns, including duplicate records, late-arriving data, incremental processing, changing customer attributes, data quality validation, retries, and pipeline idempotency.
 
 ## Tech Stack
 
@@ -51,30 +17,341 @@ dbt Snapshot (SCD2)
 - dbt
 - SQL
 
-## How the Pipeline Works
+## Architecture
 
-The Airflow DAG runs the pipeline in five main steps:
+The pipeline follows this flow:
+
+**FastAPI → Airflow → AWS S3 → Snowflake RAW → dbt staging/intermediate → dbt snapshots → analytics marts**
+
+The FastAPI application acts as the source system. Airflow handles extraction and orchestration, S3 provides the raw landing layer, Snowflake is used as the data warehouse, and dbt handles transformation, incremental processing, historical tracking, and data quality testing.
+
+## Pipeline Workflow
+
+The Airflow DAG consists of five main tasks:
+
+1. `extract_and_land`
+2. `copy_into_snowflake`
+3. `dbt_staging_and_intermediate`
+4. `dbt_customer_snapshot`
+5. `dbt_marts_and_tests`
+
+The DAG is scheduled hourly and can also be triggered manually.
+
+### API Ingestion
+
+The `producer` service is a FastAPI application that exposes two endpoints:
+
+- `/events`
+- `/customers`
+
+The API simulates changing source data rather than returning a completely static dataset.
+
+Security events include scenarios such as duplicate records, updated events, and late-arriving events. Customer records can also change between requests, which allows customer history to be tracked downstream.
+
+Airflow extracts both datasets, validates the responses, converts them to newline-delimited JSON (NDJSON), and lands each batch in S3.
+
+Files are stored using date-partitioned paths with unique filenames so that new pipeline runs do not overwrite previous batches.
+
+Example:
+
+`raw/security_events/year=2026/month=09/day=27/<run_id>.json`
+
+`raw/customers/year=2026/month=09/day=27/<run_id>.json`
+
+This keeps the S3 landing layer append-oriented and preserves the original ingestion history.
+
+## Snowflake RAW Layer
+
+Snowflake external stages reference the S3 landing locations.
+
+Airflow executes `COPY INTO` statements to load the files into:
+
+- `CYBER_INSURANCE.RAW.SECURITY_EVENTS`
+- `CYBER_INSURANCE.RAW.CUSTOMERS`
+
+The RAW layer intentionally stays close to the source data. Duplicate records and multiple versions of the same business entity are preserved instead of being removed during ingestion.
+
+An `ingestion_timestamp` is added when records enter Snowflake so that source event time can be separated from pipeline arrival time.
+
+## dbt Transformation Layers
+
+The dbt project is organized into three primary modeling layers:
+
+### Staging
+
+The staging models provide a clean interface over the RAW Snowflake tables and prepare the source data for downstream transformations.
+
+Models include:
+
+- `stg_security_events`
+- `stg_customers`
+
+### Intermediate
+
+The intermediate layer handles business-level transformation logic such as deduplication and identifying the latest version of a record.
+
+Models include:
+
+- `int_latest_events`
+- `int_latest_customers`
+
+### Analytics
+
+The final analytics layer contains:
+
+- `dim_customers`
+- `fct_security_events`
+- `daily_security_summary`
+
+The staging and intermediate models are primarily materialized as views, while the analytics models are materialized as tables.
+
+## Deduplication
+
+The source API intentionally produces duplicate versions of security events.
+
+Rather than removing those records during ingestion, the duplicates are preserved in RAW and resolved in the dbt intermediate layer.
+
+`int_latest_events.sql` uses the event business key and record timestamps to determine which version of an event should continue downstream.
+
+This keeps ingestion relatively simple while preserving the original source records for troubleshooting and reprocessing.
+
+## Late-Arriving Data
+
+The pipeline also accounts for events that arrive significantly later than when they occurred.
+
+For example, an event may have:
+
+- `event_timestamp` — when the security event actually happened
+- `updated_at` — when the source record was last updated
+- `ingestion_timestamp` — when the record entered the data platform
+
+A record could therefore have an `event_timestamp` and `updated_at` from several days ago while having an `ingestion_timestamp` from the current pipeline run.
+
+This distinction matters for incremental processing.
+
+Using only `updated_at` with a short lookback window could miss a record that arrives several days late. The fact model therefore uses `ingestion_timestamp` as the primary processing signal for newly arrived data.
+
+A lookback window is also applied so that a small amount of previously processed data is reconsidered during each incremental run.
+
+## Incremental Fact Processing
+
+`fct_security_events` is implemented as a dbt incremental model.
+
+The incremental strategy combines:
+
+- `ingestion_timestamp`
+- a lookback window
+- event-level deduplication
+- a unique business key
+- merge-based incremental processing
+
+The lookback intentionally reprocesses a small amount of recently ingested data. This helps account for processing boundaries and delayed records.
+
+Because events are deduplicated and matched using their business key, rereading records from the lookback window does not result in duplicate facts.
+
+This keeps the incremental load idempotent while still allowing recently arrived data to be reconsidered.
+
+## Customer History — SCD Type 2
+
+Customer attributes can change between source API requests.
+
+For example, a customer's `plan_tier` may change from `standard` to `premium`.
+
+Instead of overwriting the previous state, customer history is maintained using a dbt snapshot:
+
+`dbt/snapshots/customer_history.sql`
+
+The snapshot implements Slowly Changing Dimension Type 2 behavior using dbt validity fields.
+
+This preserves historical customer versions while still making it possible to identify the current version of each customer.
+
+## Analytics Models
+
+### `dim_customers`
+
+Provides the current customer dimension for downstream analytics.
+
+### `fct_security_events`
+
+Contains the deduplicated security events processed through the incremental pipeline.
+
+### `daily_security_summary`
+
+Aggregates security activity at the daily level for reporting and analytical use cases.
+
+Together, these models provide a simple dimensional layer on top of the cleaned and historical data.
+
+## Data Quality
+
+dbt tests are included as part of the pipeline rather than being treated as a separate manual validation step.
+
+The tests validate assumptions such as:
+
+- unique business keys
+- required non-null fields
+- relationships between datasets
+
+The final Airflow task executes the analytics models followed by the dbt test suite.
+
+If the tests fail, the Airflow task fails as well, preventing an invalid pipeline run from being treated as successful.
+
+## Airflow Orchestration
+
+Airflow manages dependencies between ingestion, warehouse loading, dbt transformations, snapshots, and tests.
+
+The DAG is configured with retries for transient failures and:
+
+`max_active_runs=1`
+
+This prevents a new scheduled pipeline run from overlapping with an unfinished previous run.
+
+The local environment uses Airflow's `LocalExecutor`.
+
+For this workload, LocalExecutor parallelism is set to `4`. The pipeline is mostly sequential, so the default parallelism of `32` created unnecessary worker processes and resource usage without providing additional throughput.
+
+During repeated scheduled runs, this became visible through elevated container memory usage and Airflow heartbeat failures.
+
+After isolating the dbt and Snowflake layers from the orchestration layer, the LocalExecutor worker pool was identified as a major source of unnecessary resource pressure.
+
+Reducing parallelism from 32 to 4 reduced Airflow container memory usage from approximately 5.9 GB to 1.8 GB in the local environment. The complete pipeline subsequently executed successfully in approximately 1 minute 16 seconds.
+
+## Airflow Metadata Persistence
+
+Airflow's metadata database is stored outside the disposable container using a mounted host directory.
+
+This allows DAG run history and task-instance state to survive container restarts and recreation.
+
+The metadata database itself is excluded from version control.
+
+## Docker
+
+Docker Compose is used to run the local environment.
+
+The main services are:
+
+- `mock-api`
+- `airflow`
+
+The FastAPI application and Airflow run in separate containers.
+
+Airflow reaches the API through the Docker Compose network using:
+
+`http://mock-api:8000`
+
+rather than `localhost`.
+
+Environment-specific configuration and credentials are supplied through environment variables rather than being hard-coded into the application.
+
+## Project Structure
 
 ```text
-extract_and_land
-        ↓
-copy_into_snowflake
-        ↓
-dbt_staging_and_intermediate
-        ↓
-dbt_customer_snapshot
-        ↓
-dbt_marts_and_tests
+.
+├── airflow/
+│   └── dags/
+│       └── cyber_api_to_snowflake.py
+│
+├── producer/
+│   ├── app.py
+│   ├── Dockerfile
+│   └── requirements.txt
+│
+├── snowflake/
+│   ├── setup.sql
+│   ├── create_stage.sql
+│   └── copy_into.sql
+│
+├── dbt/
+│   ├── models/
+│   │   ├── staging/
+│   │   │   ├── sources.yml
+│   │   │   ├── stg_customers.sql
+│   │   │   └── stg_security_events.sql
+│   │   │
+│   │   ├── intermediate/
+│   │   │   ├── int_latest_customers.sql
+│   │   │   └── int_latest_events.sql
+│   │   │
+│   │   └── marts/
+│   │       ├── dim_customers.sql
+│   │       ├── fct_security_events.sql
+│   │       ├── daily_security_summary.sql
+│   │       └── schema.yml
+│   │
+│   ├── snapshots/
+│   │   └── customer_history.sql
+│   │
+│   ├── dbt_project.yml
+│   └── profiles.yml
+│
+├── docker-compose.yml
+├── Dockerfile
+├── .env.example
+├── .gitignore
+└── README.md
 ```
 
-The DAG is scheduled hourly, although it can also be triggered manually from Airflow.
+## Running the Project
 
-### 1. Extracting the API Data
+Create a `.env` file based on `.env.example` and provide the required AWS and Snowflake configuration.
 
-The `producer` folder contains a small FastAPI application that acts as the source system for the project.
+The actual `.env` file is excluded from version control.
 
-It exposes two endpoints:
+Build and start the environment:
 
+```bash
+docker compose up --build -d
+```
+
+Check the running services:
+
+```bash
+docker compose ps
+```
+
+The mock API is available locally on port `8000`:
+
+```text
+http://localhost:8000/events
+http://localhost:8000/customers
+```
+
+Airflow is available locally on port `8080`.
+
+Once the environment is running, enable the `cyber_api_to_snowflake` DAG in Airflow and either trigger it manually or allow the hourly schedule to execute it.
+
+## Engineering Considerations
+
+Several design decisions in the project are intentional.
+
+**RAW data is preserved before transformation.** Duplicate and updated records remain available in the RAW layer, while business-level deduplication happens downstream.
+
+**Ingestion time is used for incremental processing.** This prevents late-arriving records from being excluded simply because their source `updated_at` values are old.
+
+**A lookback window is combined with idempotent processing.** Reprocessing a small amount of recent data provides additional protection against delayed records and processing boundaries without creating duplicate facts.
+
+**Customer changes are historized rather than overwritten.** dbt snapshots preserve previous customer states using SCD Type 2.
+
+**Data quality is part of the DAG.** dbt tests participate directly in pipeline success or failure.
+
+**Pipeline runs are prevented from overlapping.** `max_active_runs=1` keeps scheduled runs from competing for the same local resources.
+
+**Executor parallelism matches the workload.** The LocalExecutor worker pool is intentionally kept small because this DAG has limited task-level concurrency.
+
+**Airflow metadata is persistent.** Execution history is independent of the lifecycle of the Airflow container.
+
+## Potential Extensions
+
+The current implementation is focused on batch ELT. Some natural extensions would include:
+
+- a pipeline control table with explicit `last_successful_run` watermarks
+- CI/CD for dbt and Airflow changes
+- centralized secrets management
+- pipeline alerting and observability
+- automated data reconciliation
+- event-driven S3-to-Snowflake ingestion with Snowpipe
+- deployment to a managed Airflow environment
+
+Streaming requirements would be better addressed through a separate event-driven architecture rather than introducing Kafka into this pipeline without a clear real-time requirement.
 ```text
 /events
 /customers
